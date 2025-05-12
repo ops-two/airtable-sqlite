@@ -12,11 +12,12 @@ This project allows you to export data from an Airtable base into an SQLite data
     *   Search within tables.
     *   View linked records.
     *   Paginate through large datasets.
-*   **Handles Airtable Complexity**: The tool maps various Airtable field types (including lookups, rollups, linked records, select options with colors) to appropriate SQLite representations. It ensures unique and valid SQLite column names by:
-    *   `Reserving \`id\` as the primary key (TEXT) in each SQLite table to store the original Airtable Record ID.`
-    *   `Renaming any conflicting user-defined Airtable fields to avoid collision with this reserved \`id\` column. For example, an Airtable field named "ID" (case-insensitive after sanitization) would be renamed to \`id_1\`, \`id_2\`, etc.`
-    *   `Resolving other potential naming collisions that arise after sanitizing Airtable field names. For instance, if "Field A" and "Field_A" both sanitize to "Field_A", the second occurrence would be renamed (e.g., to \`Field_A_1\`).`
-    *   `The generated SQLite database includes metadata tables (\`_airtable_meta_tables\` and \`_airtable_meta_fields\`) that store details about the original Airtable schema and these SQLite column name mappings.`
+*   **Handles Airtable Complexity**: The tool maps various Airtable field types (including lookups, rollups, select options with colors) to appropriate SQLite representations. It ensures unique and valid SQLite table and column names by:
+    *   Reserving `id` as the primary key (TEXT) in each main SQLite table to store the original Airtable Record ID.
+    *   Renaming any conflicting user-defined Airtable fields named 'ID' (case-insensitive after sanitization) to avoid collision (e.g., to `id_1`).
+    *   Resolving other potential naming collisions after sanitizing Airtable field names (e.g., 'Field A' and 'Field_A' might become `Field_A` and `Field_A_1`).
+    *   **Representing Airtable 'Linked Record' fields using dedicated Junction Tables.** Instead of storing linked IDs in the main table, a separate table (e.g., `_link_SourceTable_LinkFieldName`) is created for each linked record field. This junction table contains pairs of `source_id` and `target_id`, allowing relationships to be queried using standard SQL `JOIN` operations.
+    *   The generated SQLite database includes metadata tables (`_airtable_meta_tables` and `_airtable_meta_fields`) that store details about the original Airtable schema, the SQLite table/column name mappings, and the names of the junction tables used for linked records.
 *   **Rate Limiting**: Respects Airtable API rate limits during data fetching.
 
 ## Technologies Used
@@ -208,3 +209,85 @@ This project allows you to export data from an Airtable base into an SQLite data
 ## License
 
 (Optional: Add a license if desired, e.g., MIT License.)
+
+## SQLite Schema Details (for Viewer Development)
+
+This section details how Airtable base structures are mapped to the generated SQLite database. Understanding this mapping is crucial for developing or maintaining the offline viewer.
+
+### 1. Table and Column Naming
+
+*   **Sanitization**: Airtable table and field names are sanitized to be valid SQLite identifiers. This typically involves:
+    *   Replacing non-alphanumeric characters (except underscores) with underscores (`_`).
+    *   Collapsing multiple consecutive underscores into one.
+    *   Removing leading/trailing underscores.
+    *   Example: An Airtable table "Project Milestones!" might become `Project_Milestones` in SQLite.
+*   **Metadata**: The `_airtable_meta_tables` table stores the mapping between the original Airtable table name (`name`) and its sanitized SQLite name (`sqlite_name`). Similarly, `_airtable_meta_fields` maps original field names (`name`) to their SQLite representation (`sqlite_name` or indicates a junction table).
+
+### 2. Primary Keys
+
+*   Each main data table in SQLite has a dedicated primary key column named `id`.
+*   This `id` column is of type `TEXT` and stores the **original Airtable Record ID** (e.g., `recXXXXXXXXXXXXXX`).
+*   This serves as the unique identifier for rows within the SQLite database and is used for linking records.
+
+### 3. Name De-duplication
+
+SQLite requires unique column names within a table. Conflicts can arise from sanitization or if an Airtable field is named 'ID'.
+
+*   **Reserved `id` Conflict**: If an Airtable field, after sanitization, would be named `id` (case-insensitive), it is renamed by appending `_1`, `_2`, etc. (e.g., `id_1`).
+*   **Other Conflicts**: If multiple Airtable fields sanitize to the same name within the same table (e.g., "Status" and "status" might both become `Status`), subsequent occurrences are renamed by appending `_1`, `_2`, etc. (e.g., `Status`, `Status_1`).
+*   **Metadata**: The `_airtable_meta_fields` table stores both the original Airtable field name (`name`) and the final, de-duplicated SQLite column name (`sqlite_name`) used in the `CREATE TABLE` statement (for non-linked fields).
+
+### 4. Field Type Mapping (Common Types)
+
+| Airtable Type         | SQLite Type | SQLite Value Representation                                                                 |
+| --------------------- | ----------- | ------------------------------------------------------------------------------------------- |
+| `singleLineText`, etc. | `TEXT`      | String value                                                                                |
+| `number`, `currency`  | `REAL` / `INTEGER` | Numeric value (REAL if precision > 0)                                                    |
+| `checkbox`            | `INTEGER`   | `1` (true) or `0` (false)                                                                   |
+| `date`, `dateTime`    | `TEXT`      | ISO 8601 formatted date/time string                                                        |
+| `singleSelect`        | `TEXT`      | The name (string) of the selected option                                                    |
+| `multipleSelects`     | `TEXT`      | JSON string array of selected option names (e.g., `["Option A", "Option B"]`)           |
+| `singleCollaborator`  | `TEXT`      | Collaborator's name or email (best available identifier)                                  |
+| `multipleCollaborators`| `TEXT`      | JSON string array of collaborator objects (containing id, email, name)                   |
+| `attachment`          | `TEXT`      | JSON string array of attachment objects (id, url, filename, size, type, etc.)             |
+| `formula`, `lookup`   | Varies      | Mapped based on the *result type* of the formula/lookup (often `TEXT` or `REAL`/`INTEGER`) |
+| **`multipleRecordLinks`** | **(See Below)** | **Handled via Junction Tables**                                                           |
+
+*   **Note**: The `_airtable_meta_fields` table stores the original `type` and `options_json` (e.g., select choices, linked table ID) which the viewer needs for proper display and interaction.
+
+### 5. Linked Records (Junction Tables)
+
+Airtable's `multipleRecordLinks` fields are *not* represented as columns in the main SQLite tables. Instead:
+
+*   **Junction Table**: For each linked record field, a separate **junction table** is created.
+*   **Naming Convention**: The junction table is named `_link_<SourceTableSQLiteName>_<FieldSQLiteName>` (e.g., `_link_Projects_Tasks`). The specific name is stored in the `junction_table_name` column of the `_airtable_meta_fields` table for that field.
+*   **Columns**: Each junction table has two `TEXT` columns:
+    *   `source_id`: Stores the `id` (Airtable Record ID) of the record in the source table.
+    *   `target_id`: Stores the `id` (Airtable Record ID) of a linked record in the target table.
+*   **Relationship**: A many-to-many relationship is represented by multiple rows in the junction table for a single `source_id`.
+*   **Viewer Querying**: To get the linked records for a specific source record (e.g., project `recABC`), the viewer should:
+    1.  Find the junction table name from `_airtable_meta_fields` for the relevant field.
+    2.  Query the junction table: `SELECT target_id FROM <junction_table_name> WHERE source_id = 'recABC';`
+    3.  Use the retrieved `target_id` values to query the target table (whose SQLite name can also be found via `_airtable_meta_fields` options or by joining `_airtable_meta_tables`): `SELECT * FROM <TargetTableSQLiteName> WHERE id IN ('target_id_1', 'target_id_2', ...);`
+
+### 6. Metadata Tables
+
+These tables are essential for the viewer to interpret the data correctly.
+
+*   **`_airtable_meta_tables`**: Stores information about each table.
+    *   `id`: Original Airtable Table ID.
+    *   `name`: Original Airtable Table Name.
+    *   `sqlite_name`: Sanitized name used for the SQLite table.
+    *   `primary_field_id`: Original Airtable ID of the table's primary field.
+*   **`_airtable_meta_fields`**: Stores information about each field.
+    *   `id`: Original Airtable Field ID.
+    *   `table_id`: Foreign key to `_airtable_meta_tables.id`.
+    *   `name`: Original Airtable Field Name.
+    *   `sqlite_name`: Sanitized & de-duplicated name used for the SQLite column (if *not* a link field).
+    *   `type`: Original Airtable field type (e.g., `singleLineText`, `multipleRecordLinks`).
+    *   `options_json`: JSON string of field options (vital for selects, linked record details like `linkedTableId`).
+    *   `airtable_description`: Original Airtable field description.
+    *   `is_primary_key`: `1` only for the synthetic `id` column, `0` otherwise.
+    *   `junction_table_name`: Contains the name of the junction table if `type` is `multipleRecordLinks`, `NULL` otherwise.
+
+By using these metadata tables, the viewer can dynamically reconstruct the original Airtable structure, display appropriate field types, find linked records via junction tables, and present the data meaningfully.

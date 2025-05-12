@@ -18,7 +18,17 @@ app.use(express.static(path.join(__dirname, 'public'))); // Serve static files f
 
 // --- Helper Functions ---
 function sanitizeColumnName(name) {
-    return name.replace(/[^a-zA-Z0-9_]/g, '_');
+    // Allow alphanumeric and underscore, replace others with underscore, collapse multiple underscores
+    let sanitized = name.replace(/[^a-zA-Z0-9_]/g, '_').replace(/_{2,}/g, '_');
+    // Remove leading/trailing underscores if the name isn't just underscores
+    if (sanitized.length > 1) {
+        sanitized = sanitized.replace(/^_+|_+$/g, '');
+    }
+    // Handle potential empty string after sanitization (e.g., if input was just '-')
+    if (!sanitized) {
+        return '_invalid_name_';
+    }
+    return sanitized;
 }
 
 function mapAirtableTypeToSQLite(airtableType, options) {
@@ -96,6 +106,10 @@ function getDeDuplicatedColumnMappings(airtableFields, tableSchemaPrimaryFieldId
         });
     }
     return mappings;
+}
+
+function generateJunctionTableName(sourceTableSqliteName, fieldSqliteName) {
+    return `_link_${sourceTableSqliteName}_${fieldSqliteName}`;
 }
 
 // --- API Routes ---
@@ -196,17 +210,18 @@ app.post('/api/generate-snapshot', async (req, res) => {
         db.exec(`
             CREATE TABLE IF NOT EXISTS _airtable_meta_fields (
                 id TEXT PRIMARY KEY,              -- Airtable Field ID
-                table_id TEXT NOT NULL,           -- Airtable Table ID (references _airtable_meta_tables.id)
+                table_id TEXT NOT NULL,           -- Foreign key to _airtable_meta_tables
                 name TEXT NOT NULL,               -- Original Airtable field name
-                sqlite_name TEXT NOT NULL,        -- Sanitized SQLite column name
+                sqlite_name TEXT NOT NULL,        -- De-duplicated SQLite column name (for non-link fields)
                 type TEXT NOT NULL,               -- Airtable field type
                 options_json TEXT,                -- JSON string of field options (e.g., for select, linkedRecord)
                 airtable_description TEXT,        -- Airtable field description
                 is_primary_key INTEGER DEFAULT 0, -- Boolean (0 or 1), for the synthetic 'id' PK column
+                junction_table_name TEXT,         -- Name of the junction table if type is 'multipleRecordLinks'
                 FOREIGN KEY (table_id) REFERENCES _airtable_meta_tables(id)
             );
         `);
-        console.log('[LOG] Created metadata tables (_airtable_meta_tables, _airtable_meta_fields).');
+        console.log('[LOG] Created/verified metadata tables (_airtable_meta_tables, _airtable_meta_fields).');
         // --- End Create Metadata Tables ---
 
         const viewerConfigData = { // This structure will be used to populate metadata tables
@@ -219,8 +234,11 @@ app.post('/api/generate-snapshot', async (req, res) => {
             `INSERT INTO _airtable_meta_tables (id, name, sqlite_name, primary_field_id) VALUES (@id, @name, @sqlite_name, @primary_field_id)`
         );
         const insertMetaFieldStmt = db.prepare(
-            `INSERT INTO _airtable_meta_fields (id, table_id, name, sqlite_name, type, options_json, airtable_description, is_primary_key) VALUES (@id, @table_id, @name, @sqlite_name, @type, @options_json, @airtable_description, @is_primary_key)`
+            `INSERT INTO _airtable_meta_fields (id, table_id, name, sqlite_name, type, options_json, airtable_description, is_primary_key, junction_table_name) VALUES (@id, @table_id, @name, @sqlite_name, @type, @options_json, @airtable_description, @is_primary_key, @junction_table_name)`
         );
+
+        // Structure to hold info about junction tables needed
+        const junctionTablesToCreate = [];
 
         // Start transaction for metadata insertion
         db.transaction(() => {
@@ -250,141 +268,263 @@ app.post('/api/generate-snapshot', async (req, res) => {
                     type: 'id', // Synthetic type
                     options_json: null,
                     airtable_description: 'Airtable Record ID (Primary Key)',
-                    is_primary_key: 1
+                    is_primary_key: 1,
+                    junction_table_name: null // PK is never a junction table
                 });
 
                 // Get de-duplicated column mappings for user fields
+                // IMPORTANT: This mapping now includes fields that WON'T become direct columns (like multipleRecordLinks)
+                // but we need their final SQLite name for generating junction table names correctly.
                 const finalFieldMappings = getDeDuplicatedColumnMappings(tableSchema.fields, tableSchema.primaryFieldId, 'id');
 
                 for (const mapping of finalFieldMappings) {
-                    // Insert into _airtable_meta_fields with de-duplicated name
+                    let junctionTableName = null;
+                    // Generate junction table info if it's a link field
+                    if (mapping.airtableType === 'multipleRecordLinks') {
+                        junctionTableName = generateJunctionTableName(sqliteTableName, mapping.sqliteName);
+                        junctionTablesToCreate.push({
+                            name: junctionTableName,
+                            sourceTableSqliteName: sqliteTableName,
+                            fieldSqliteName: mapping.sqliteName, // Store the sanitized field name too
+                            linkedTableId: mapping.airtableOptions?.linkedTableId // Store linked table Airtable ID
+                        });
+                    }
+
+                    // Insert into _airtable_meta_fields with de-duplicated name AND junction table name if applicable
                     insertMetaFieldStmt.run({
                         id: mapping.airtableFieldId,
                         table_id: tableSchema.id,
                         name: mapping.airtableName, // Original Airtable field name
-                        sqlite_name: mapping.sqliteName, // De-duplicated SQLite name
+                        sqlite_name: mapping.sqliteName, // De-duplicated SQLite name (used for junction name generation)
                         type: mapping.airtableType,
                         options_json: mapping.airtableOptions ? JSON.stringify(mapping.airtableOptions) : null,
                         airtable_description: mapping.airtableDescription || null,
-                        is_primary_key: 0 // User fields are not the synthetic PK
+                        is_primary_key: 0, // User fields are never the synthetic PK
+                        junction_table_name: junctionTableName // Store junction table name here
                     });
 
-                    // Populate tableConfigEntry.fields for viewerConfigData with de-duplicated names
-                    tableConfigEntry.fields.push({
+                    // Add field info to viewerConfigData
+                    const fieldConfig = {
                         id: mapping.airtableFieldId,
                         name: mapping.airtableName, // Original Airtable field name for display
-                        sqliteName: mapping.sqliteName, // De-duplicated SQLite name for querying
+                        sqliteName: mapping.sqliteName, // De-duplicated SQLite name (relevant for non-links or junction naming)
                         type: mapping.airtableType,
                         options: mapping.airtableOptions || null,
                         description: mapping.airtableDescription || null,
                         isAirtablePrimary: mapping.isAirtablePrimaryField
-                    });
+                    };
+                    // Add junction table info to viewer config if applicable
+                    if (junctionTableName) {
+                        fieldConfig.junctionTable = junctionTableName;
+                        fieldConfig.sourceColumn = 'source_id'; // Standardize junction column names
+                        fieldConfig.targetColumn = 'target_id';
+                        // linkedTableId is already in options, but could be duplicated for easier access
+                        // fieldConfig.linkedTableId = mapping.airtableOptions?.linkedTableId;
+                    }
+                    tableConfigEntry.fields.push(fieldConfig);
                 }
                 viewerConfigData.tables.push(tableConfigEntry);
             }
         })();
         console.log('[LOG] Populated metadata tables and prepared viewerConfigData.');
 
-        // 2. Process each table (for data)
+        // 2. Create ACTUAL Data Tables (Main + Junction)
+        // A map to store prepared statements for junction table inserts, keyed by junction table name
+        const junctionInsertStmts = {};
+
+        db.transaction(() => {
+            // First create all main tables
+            for (const tableSchema of tablesSchema) {
+                console.log(`\n[LOG] Defining schema for table: '${tableSchema.name}' (ID: ${tableSchema.id})`);
+
+                const sqliteTableName = sanitizeColumnName(tableSchema.name);
+                // Find the corresponding viewer config entry which now contains final field mappings
+                const tableViewerConfig = viewerConfigData.tables.find(t => t.id === tableSchema.id);
+                if (!tableViewerConfig) {
+                    console.error(`[CRITICAL] No viewerConfigData entry for table ${tableSchema.name} (${tableSchema.id}). Skipping table creation.`);
+                    continue;
+                }
+
+                let createTableQuery = `CREATE TABLE IF NOT EXISTS "${sqliteTableName}" (id TEXT PRIMARY KEY`;
+                const fieldDefinitionsForCreateTable = [];
+
+                // Iterate through the fields DEFINED FOR THE VIEWER CONFIG for this table
+                for (const fieldConfig of tableViewerConfig.fields) {
+                    // *** Only add column definition if it's NOT a linked record field ***
+                    if (fieldConfig.type !== 'multipleRecordLinks') {
+                        const sqliteType = mapAirtableTypeToSQLite(fieldConfig.type, fieldConfig.options);
+                        // fieldConfig.sqliteName is the de-duplicated name
+                        fieldDefinitionsForCreateTable.push(`"${fieldConfig.sqliteName}" ${sqliteType}`);
+                    }
+                }
+
+                if (fieldDefinitionsForCreateTable.length > 0) {
+                    createTableQuery += `, ${fieldDefinitionsForCreateTable.join(', ')}`;
+                }
+                createTableQuery += ');';
+
+                console.log(`[LOG] CREATE TABLE statement for main table '${sqliteTableName}': ${createTableQuery}`);
+                db.exec(createTableQuery);
+                // Create basic index on primary key
+                db.exec(`CREATE INDEX IF NOT EXISTS idx_${sqliteTableName}_pk ON "${sqliteTableName}" (id);`);
+            }
+
+            // Now create all necessary junction tables
+            console.log('\n[LOG] Creating junction tables...');
+            const createdJunctionTables = new Set();
+            for (const junctionInfo of junctionTablesToCreate) {
+                if (createdJunctionTables.has(junctionInfo.name)) continue; // Avoid duplicate creation attempts
+
+                const createJunctionQuery = `
+                    CREATE TABLE IF NOT EXISTS "${junctionInfo.name}" (
+                        source_id TEXT NOT NULL, 
+                        target_id TEXT NOT NULL,
+                        PRIMARY KEY (source_id, target_id)
+                        -- Optional: FOREIGN KEY(source_id) REFERENCES "${junctionInfo.sourceTableSqliteName}"(id), 
+                        -- Optional: Add foreign key for target_id if we map linkedTableId to its sqlite name
+                    );
+                `;
+                console.log(`[LOG] CREATE TABLE statement for junction table '${junctionInfo.name}': ${createJunctionQuery}`);
+                db.exec(createJunctionQuery);
+                // Create indexes for faster lookups on junction tables
+                db.exec(`CREATE INDEX IF NOT EXISTS idx_${junctionInfo.name}_source ON "${junctionInfo.name}" (source_id);`);
+                db.exec(`CREATE INDEX IF NOT EXISTS idx_${junctionInfo.name}_target ON "${junctionInfo.name}" (target_id);`);
+                
+                // Prepare the insert statement for this junction table
+                const insertJunctionSql = `INSERT OR IGNORE INTO "${junctionInfo.name}" (source_id, target_id) VALUES (?, ?)`;
+                junctionInsertStmts[junctionInfo.name] = db.prepare(insertJunctionSql);
+                
+                createdJunctionTables.add(junctionInfo.name);
+            }
+            console.log('[LOG] Finished creating junction tables.');
+
+        })(); // End transaction for table creation
+
+        // 3. Process each table (Fetch data and Populate Main + Junction Tables)
         for (const tableSchema of tablesSchema) {
-            console.log(`\n[LOG] Processing table: '${tableSchema.name}' (ID: ${tableSchema.id})`);
-            
             const sqliteTableName = sanitizeColumnName(tableSchema.name);
-            // Retrieve the de-duplicated field configurations from viewerConfigData
             const tableViewerConfig = viewerConfigData.tables.find(t => t.id === tableSchema.id);
+
             if (!tableViewerConfig) {
-                console.error(`[CRITICAL] No viewerConfigData entry for table ${tableSchema.name} (${tableSchema.id}). Skipping table creation.`);
+                console.warn(`[WARN] Skipping data population for table ${tableSchema.name} (${tableSchema.id}) as its config was not found.`);
                 continue; 
             }
+            console.log(`\n[LOG] Fetching and populating data for table: '${tableSchema.name}' (SQLite: '${sqliteTableName}')`);
 
-            let createTableQuery = `CREATE TABLE IF NOT EXISTS "${sqliteTableName}" (id TEXT PRIMARY KEY`;
-            const fieldDefinitionsForCreateTable = [];
-            // This columnMappings is for the data insertion step, ensuring it uses the same names as table creation
-            const columnMappingsForInsert = [{ airtableName: 'id', sqliteName: 'id', airtableType: 'text', airtableOptions: null }]; 
-
-            for (const fieldConfig of tableViewerConfig.fields) {
-                // fieldConfig.sqliteName is already de-duplicated
-                // fieldConfig.type is airtableType
-                const sqliteType = mapAirtableTypeToSQLite(fieldConfig.type, fieldConfig.options);
-                fieldDefinitionsForCreateTable.push(`"${fieldConfig.sqliteName}" ${sqliteType}`);
-                columnMappingsForInsert.push({
-                    airtableName: fieldConfig.name, // Original Airtable name, for matching with fetched data
-                    sqliteName: fieldConfig.sqliteName, // De-duplicated SQLite name
-                    airtableType: fieldConfig.type,
-                    airtableOptions: fieldConfig.options
-                });
-            }
-
-            if (fieldDefinitionsForCreateTable.length > 0) {
-                createTableQuery += `, ${fieldDefinitionsForCreateTable.join(', ')}`;
-            }
-            createTableQuery += ');';
-
-            console.log(`[LOG] CREATE TABLE statement for '${sqliteTableName}': ${createTableQuery}`);
-            db.exec(createTableQuery);
-
-            // Fetch all records for this table
+            // Fetch all records for this table (same as before)
             console.log(`[LOG] Fetching records for table '${tableSchema.name}'...`);
             let allRecords = [];
             let offset = null;
             do {
-                await new Promise(resolve => setTimeout(resolve, AIRTABLE_RATE_LIMIT_DELAY));
+                // Ensure rate limiting between fetches
+                await new Promise(resolve => setTimeout(resolve, AIRTABLE_RATE_LIMIT_DELAY)); 
                 const airtableApiUrl = `${AIRTABLE_API_BASE_URL}/${baseId}/${tableSchema.id}`;
-                const response = await axios.get(airtableApiUrl, {
-                    headers: { 'Authorization': `Bearer ${apiKey}` },
-                    params: { offset: offset }
-                });
-                allRecords = allRecords.concat(response.data.records);
-                offset = response.data.offset;
+                try {
+                    const response = await axios.get(airtableApiUrl, {
+                        headers: { 'Authorization': `Bearer ${apiKey}` },
+                        params: { offset: offset }
+                    });
+                    allRecords = allRecords.concat(response.data.records);
+                    offset = response.data.offset;
+                    console.log(`[LOG] Fetched ${response.data.records.length} records for ${tableSchema.name}. Total: ${allRecords.length}. Next offset: ${offset}`);
+                } catch (fetchError) {
+                    console.error(`[ERROR] Failed to fetch records for table ${tableSchema.name} (offset: ${offset}):`, fetchError.response?.data || fetchError.message);
+                    offset = null; // Stop fetching for this table on error
+                    // Decide if you want to throw or just log and continue with partial data
+                    // For now, log and break the loop for this table
+                    break; 
+                }
             } while (offset);
-            console.log(`[LOG] Fetched ${allRecords.length} records for table '${tableSchema.name}'.`);
+            console.log(`[LOG] Finished fetching. Total ${allRecords.length} records for table '${tableSchema.name}'.`);
 
-            if (allRecords.length === 0) {
-                console.log(`[LOG] No records to insert for table '${sqliteTableName}'.`);
-                continue;
-            }
+            // Prepare insert statement dynamically for the MAIN table
+            // Only include columns that are NOT link types
+            const columnsForMainInsert = tableViewerConfig.fields
+                .filter(f => f.type !== 'multipleRecordLinks')
+                .map(f => ({ 
+                    airtableName: f.name, 
+                    sqliteName: f.sqliteName, 
+                    airtableType: f.type, 
+                    airtableOptions: f.options 
+                }));
+            // Add the 'id' primary key column mapping explicitly
+            const allMappingsForMainInsert = [
+                { airtableName: 'id', sqliteName: 'id', airtableType: 'text', airtableOptions: null },
+                ...columnsForMainInsert
+            ];
 
-            // Prepare insert statement dynamically based on de-duplicated column names
-            const insertColumnNames = columnMappingsForInsert.map(m => `"${m.sqliteName}"`).join(', ');
-            const insertPlaceholders = columnMappingsForInsert.map(() => '?').join(', ');
+            const insertColumnNames = allMappingsForMainInsert.map(m => `"${m.sqliteName}"`).join(', ');
+            const insertPlaceholders = allMappingsForMainInsert.map(() => '?').join(', ');
             const insertSql = `INSERT INTO "${sqliteTableName}" (${insertColumnNames}) VALUES (${insertPlaceholders})`;
-            console.log(`[LOG] Insert SQL for ${sqliteTableName}: ${insertSql}`)
+            console.log(`[LOG] Insert SQL for ${sqliteTableName} (Main Table): ${insertSql}`) 
             const insertStmt = db.prepare(insertSql);
 
-            let successfulInserts = 0;
-            let failedInserts = 0;
+            // Get info about link fields for THIS table to populate junction tables
+            const linkFieldsForThisTable = tableViewerConfig.fields.filter(f => f.type === 'multipleRecordLinks');
 
-            // Batch insert records
-            const insertMany = db.transaction((records) => {
+            // Batch insert records (Main Table and Junction Tables)
+            const insertTransaction = db.transaction((records) => {
+                let successfulMainInserts = 0;
+                let failedMainInserts = 0;
+                let successfulJunctionInserts = 0;
+                let failedJunctionInserts = 0;
+
                 for (const record of records) {
-                    const valuesToInsert = columnMappingsForInsert.map(mapping => {
+                    // 1. Prepare values for the MAIN table insert
+                    const valuesToInsertMain = allMappingsForMainInsert.map(mapping => {
                         if (mapping.sqliteName === 'id') {
                             return record.id; // Airtable Record ID for our 'id' PK column
                         }
-                        // For other columns, use mapping.airtableName (original) to find data in record.fields
                         const rawValue = record.fields[mapping.airtableName];
                         return formatValueForSQLite(rawValue, mapping.airtableType, mapping.airtableOptions);
                     });
 
+                    // 2. Insert into the MAIN table
                     try {
-                        const info = insertStmt.run(valuesToInsert);
-                        if (info.changes > 0) successfulInserts++;
+                        insertStmt.run(valuesToInsertMain);
+                        successfulMainInserts++;
                     } catch (insertError) {
-                        failedInserts++;
-                        console.error(`[IMPORTANT ERROR] Skipping record due to insert error in table ${sqliteTableName}: ${insertError.message} Record ID: ${record.id} Problematic Data: ${JSON.stringify(record.fields)} Raw values for insert: ${JSON.stringify(valuesToInsert)}`);
+                        failedMainInserts++;
+                        console.error(`[IMPORTANT ERROR] Skipping main record insert due to error in table ${sqliteTableName}: ${insertError.message} Record ID: ${record.id} Problematic Data: ${JSON.stringify(record.fields)} Raw values for insert: ${JSON.stringify(valuesToInsertMain)}`);
+                        // If main insert fails, skip junction inserts for this record
+                        continue; 
+                    }
+
+                    // 3. Insert into JUNCTION tables for this record
+                    for (const linkField of linkFieldsForThisTable) {
+                        const linkedRecordIds = record.fields[linkField.name]; // Original Airtable name to get data
+                        const junctionTableName = linkField.junctionTable;
+                        const junctionStmt = junctionInsertStmts[junctionTableName]; // Get the prepared statement
+
+                        if (linkedRecordIds && Array.isArray(linkedRecordIds) && junctionStmt) {
+                            for (const linkedRecordId of linkedRecordIds) {
+                                try {
+                                    // Insert pair: (source record ID, target record ID)
+                                    junctionStmt.run(record.id, linkedRecordId);
+                                    successfulJunctionInserts++;
+                                } catch (junctionError) {
+                                    // Use OR IGNORE in junction insert, so duplicates aren't errors
+                                    // Log other potential errors
+                                    if (!junctionError.message.includes('UNIQUE constraint failed')) { 
+                                        failedJunctionInserts++;
+                                        console.error(`[ERROR] Inserting into junction table ${junctionTableName}: ${junctionError.message} SourceID: ${record.id}, TargetID: ${linkedRecordId}`);
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
+                // Return stats from transaction
+                return { successfulMainInserts, failedMainInserts, successfulJunctionInserts, failedJunctionInserts }; 
             });
 
-            console.log(`[LOG] Starting batch insert for ${allRecords.length} records into '${sqliteTableName}'...`);
-            insertMany(allRecords);
-            console.log(`[LOG] Inserted ${successfulInserts} records successfully into '${sqliteTableName}'.`);
-            if (failedInserts > 0) {
-                console.warn(`[LOG] Failed to insert ${failedInserts} records into '${sqliteTableName}'.`);
-            }
+            console.log(`[LOG] Starting batch insert transaction for ${allRecords.length} records into main table '${sqliteTableName}' and related junction tables...`);
+            const insertStats = insertTransaction(allRecords);
+            console.log(`[LOG] Main Table ('${sqliteTableName}') Inserts: ${insertStats.successfulMainInserts} successful, ${insertStats.failedMainInserts} failed.`);
+            console.log(`[LOG] Junction Table Inserts (related to ${sqliteTableName}): ${insertStats.successfulJunctionInserts} successful, ${insertStats.failedJunctionInserts} failed.`);
 
-            // Create basic indexes
-            db.exec(`CREATE INDEX IF NOT EXISTS idx_${sqliteTableName}_pk ON "${sqliteTableName}" (id);`);
+            // Remove main table index creation from here, as it's done during table creation
+            // db.exec(`CREATE INDEX IF NOT EXISTS idx_${sqliteTableName}_pk ON "${sqliteTableName}" (id);`);
         }
         db.close();
         console.log("[LOG] Database closed.");
