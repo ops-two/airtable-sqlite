@@ -60,8 +60,42 @@ function formatValueForSQLite(value, airtableType, airtableOptions) {
         case 'date': case 'dateTime': return value;
         case 'number': case 'currency': case 'percent': case 'duration':
             return Number(value);
-        default: return value;
+        default: return String(value); // Ensure everything else is a string if not null
     }
+}
+
+function getDeDuplicatedColumnMappings(airtableFields, tableSchemaPrimaryFieldId, existingPKSqliteName = 'id') {
+    const mappings = [];
+    const usedSQLiteNames = new Set([existingPKSqliteName.toLowerCase()]);
+
+    for (const field of airtableFields) {
+        let sqliteColumnName = sanitizeColumnName(field.name);
+        let baseNameForSuffixing = sqliteColumnName;
+
+        if (sqliteColumnName.toLowerCase() === existingPKSqliteName.toLowerCase() || usedSQLiteNames.has(sqliteColumnName.toLowerCase())) {
+            if (sqliteColumnName.toLowerCase() === existingPKSqliteName.toLowerCase()) {
+                baseNameForSuffixing = existingPKSqliteName;
+            }
+            let suffix = 1;
+            let newNameTry = `${baseNameForSuffixing}_${suffix}`;
+            while (usedSQLiteNames.has(newNameTry.toLowerCase())) {
+                suffix++;
+                newNameTry = `${baseNameForSuffixing}_${suffix}`;
+            }
+            sqliteColumnName = newNameTry;
+        }
+        usedSQLiteNames.add(sqliteColumnName.toLowerCase());
+        mappings.push({
+            airtableFieldId: field.id,
+            airtableName: field.name,
+            airtableType: field.type,
+            airtableOptions: field.options,
+            airtableDescription: field.description,
+            sqliteName: sqliteColumnName, // Final, de-duplicated name
+            isAirtablePrimaryField: field.id === tableSchemaPrimaryFieldId
+        });
+    }
+    return mappings;
 }
 
 // --- API Routes ---
@@ -152,7 +186,7 @@ app.post('/api/generate-snapshot', async (req, res) => {
 
         // --- Create Metadata Tables ---
         db.exec(`
-            CREATE TABLE IF NOT EXISTS _airtable_meta_tables_ (
+            CREATE TABLE IF NOT EXISTS _airtable_meta_tables (
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
                 sqlite_name TEXT NOT NULL,
@@ -160,19 +194,19 @@ app.post('/api/generate-snapshot', async (req, res) => {
             );
         `);
         db.exec(`
-            CREATE TABLE IF NOT EXISTS _airtable_meta_fields_v2 (
-                id TEXT PRIMARY KEY,
-                table_id TEXT NOT NULL,
-                name TEXT NOT NULL,
-                sqlite_name TEXT NOT NULL,
-                type TEXT NOT NULL,
-                options_json TEXT, 
-                airtable_description TEXT,
-                is_primary_key INTEGER,
-                FOREIGN KEY (table_id) REFERENCES _airtable_meta_tables_(id)
+            CREATE TABLE IF NOT EXISTS _airtable_meta_fields (
+                id TEXT PRIMARY KEY,              -- Airtable Field ID
+                table_id TEXT NOT NULL,           -- Airtable Table ID (references _airtable_meta_tables.id)
+                name TEXT NOT NULL,               -- Original Airtable field name
+                sqlite_name TEXT NOT NULL,        -- Sanitized SQLite column name
+                type TEXT NOT NULL,               -- Airtable field type
+                options_json TEXT,                -- JSON string of field options (e.g., for select, linkedRecord)
+                airtable_description TEXT,        -- Airtable field description
+                is_primary_key INTEGER DEFAULT 0, -- Boolean (0 or 1), for the synthetic 'id' PK column
+                FOREIGN KEY (table_id) REFERENCES _airtable_meta_tables(id)
             );
         `);
-        console.log('[LOG] Created metadata tables (_airtable_meta_tables_, _airtable_meta_fields_v2).');
+        console.log('[LOG] Created metadata tables (_airtable_meta_tables, _airtable_meta_fields).');
         // --- End Create Metadata Tables ---
 
         const viewerConfigData = { // This structure will be used to populate metadata tables
@@ -182,17 +216,16 @@ app.post('/api/generate-snapshot', async (req, res) => {
 
         // Prepare statements for inserting metadata
         const insertMetaTableStmt = db.prepare(
-            `INSERT INTO _airtable_meta_tables_ (id, name, sqlite_name, primary_field_id) VALUES (@id, @name, @sqlite_name, @primary_field_id)`
+            `INSERT INTO _airtable_meta_tables (id, name, sqlite_name, primary_field_id) VALUES (@id, @name, @sqlite_name, @primary_field_id)`
         );
         const insertMetaFieldStmt = db.prepare(
-            `INSERT INTO _airtable_meta_fields_v2 (id, table_id, name, sqlite_name, type, options_json, airtable_description, is_primary_key) VALUES (@id, @table_id, @name, @sqlite_name, @type, @options_json, @airtable_description, @is_primary_key)`
+            `INSERT INTO _airtable_meta_fields (id, table_id, name, sqlite_name, type, options_json, airtable_description, is_primary_key) VALUES (@id, @table_id, @name, @sqlite_name, @type, @options_json, @airtable_description, @is_primary_key)`
         );
 
         // Start transaction for metadata insertion
         db.transaction(() => {
             for (const tableSchema of tablesSchema) {
                 const sqliteTableName = sanitizeColumnName(tableSchema.name);
-                // Insert into _airtable_meta_tables_
                 insertMetaTableStmt.run({
                     id: tableSchema.id,
                     name: tableSchema.name,
@@ -200,161 +233,145 @@ app.post('/api/generate-snapshot', async (req, res) => {
                     primary_field_id: tableSchema.primaryFieldId || null
                 });
 
-                // This part of viewerConfigData is for reference or can be removed if not used later in this function
                 const tableConfigEntry = {
                     id: tableSchema.id,
                     name: tableSchema.name,
                     sqliteName: sqliteTableName,
-                    fields: []
+                    fields: [],
+                    primaryFieldId: tableSchema.primaryFieldId
                 };
 
-                // Insert metadata for the 'id' primary key column
+                // Insert metadata for the 'id' primary key column (represents Airtable Record ID)
                 insertMetaFieldStmt.run({
-                    id: `synthetic_pk_id_for_${tableSchema.id}`,  // airtable_field_id (synthetic)
-                    table_id: tableSchema.id,                             // airtable_table_id
-                    name: 'Record ID',                                // airtable_name (display name)
-                    sqlite_name: 'id',                                       // sqlite_name (actual column name)
-                    type: 'recordId',                                 // airtable_type (custom type for viewer)
-                    options_json: null,                                       // options_json
-                    airtable_description: 'Airtable Record ID (Primary Key)',         // airtable_description
-                    is_primary_key: 1                                           // is_primary_key (true)
+                    id: `synthetic_pk_id_for_${tableSchema.id}`,
+                    table_id: tableSchema.id,
+                    name: 'Record ID', // Display name for the PK
+                    sqlite_name: 'id', // Actual SQLite column name for the PK
+                    type: 'id', // Synthetic type
+                    options_json: null,
+                    airtable_description: 'Airtable Record ID (Primary Key)',
+                    is_primary_key: 1
                 });
 
-                for (const field of tableSchema.fields) {
-                    const sqliteColumnName = sanitizeColumnName(field.name);
-                    // Insert into _airtable_meta_fields_v2
+                // Get de-duplicated column mappings for user fields
+                const finalFieldMappings = getDeDuplicatedColumnMappings(tableSchema.fields, tableSchema.primaryFieldId, 'id');
+
+                for (const mapping of finalFieldMappings) {
+                    // Insert into _airtable_meta_fields with de-duplicated name
                     insertMetaFieldStmt.run({
-                        id: field.id,
+                        id: mapping.airtableFieldId,
                         table_id: tableSchema.id,
-                        name: field.name,
-                        sqlite_name: sqliteColumnName,
-                        type: field.type,
-                        options_json: field.options ? JSON.stringify(field.options) : null,
-                        airtable_description: field.description || '',
-                        is_primary_key: field.id === tableSchema.primaryFieldId ? 1 : 0
+                        name: mapping.airtableName, // Original Airtable field name
+                        sqlite_name: mapping.sqliteName, // De-duplicated SQLite name
+                        type: mapping.airtableType,
+                        options_json: mapping.airtableOptions ? JSON.stringify(mapping.airtableOptions) : null,
+                        airtable_description: mapping.airtableDescription || null,
+                        is_primary_key: 0 // User fields are not the synthetic PK
                     });
+
+                    // Populate tableConfigEntry.fields for viewerConfigData with de-duplicated names
                     tableConfigEntry.fields.push({
-                        id: field.id,
-                        name: sqliteColumnName, // In metadata, we should store original name, and sqlite_name as separate
-                        originalName: field.name,
-                        type: field.type,
-                        options: field.options || null
+                        id: mapping.airtableFieldId,
+                        name: mapping.airtableName, // Original Airtable field name for display
+                        sqliteName: mapping.sqliteName, // De-duplicated SQLite name for querying
+                        type: mapping.airtableType,
+                        options: mapping.airtableOptions || null,
+                        description: mapping.airtableDescription || null,
+                        isAirtablePrimary: mapping.isAirtablePrimaryField
                     });
                 }
-                viewerConfigData.tables.push(tableConfigEntry); // Still useful for building data tables if logic relies on it
+                viewerConfigData.tables.push(tableConfigEntry);
             }
         })();
-        console.log('[LOG] Populated metadata tables.');
+        console.log('[LOG] Populated metadata tables and prepared viewerConfigData.');
 
         // 2. Process each table (for data)
         for (const tableSchema of tablesSchema) {
             console.log(`\n[LOG] Processing table: '${tableSchema.name}' (ID: ${tableSchema.id})`);
-            // viewerConfigData.tables.push({ // This logic is now part of metadata population above
-            //     id: tableSchema.id,
-            //     name: tableSchema.name, // Original name for display
-            //     sqliteName: sanitizeColumnName(tableSchema.name), // Sanitized name for DB
-            //     fields: tableSchema.fields.map(f => ({
-            //         id: f.id,
-            //         name: sanitizeColumnName(f.name), // Sanitized name for DB column
-            //         originalName: f.name, // Original name for display/logic
-            //         type: f.type,
-            //         options: f.options || null
-            //     }))
-            // });
-
+            
             const sqliteTableName = sanitizeColumnName(tableSchema.name);
-            let createTableQuery = `CREATE TABLE IF NOT EXISTS "${sqliteTableName}" (id TEXT PRIMARY KEY`;
-            const columnMappings = [{ airtableName: 'id', sqliteName: 'id', airtableType: 'text' }];
+            // Retrieve the de-duplicated field configurations from viewerConfigData
+            const tableViewerConfig = viewerConfigData.tables.find(t => t.id === tableSchema.id);
+            if (!tableViewerConfig) {
+                console.error(`[CRITICAL] No viewerConfigData entry for table ${tableSchema.name} (${tableSchema.id}). Skipping table creation.`);
+                continue; 
+            }
 
-            for (const field of tableSchema.fields) {
-                const sqliteColumnName = sanitizeColumnName(field.name);
-                const sqliteType = mapAirtableTypeToSQLite(field.type, field.options);
-                createTableQuery += `, "${sqliteColumnName}" ${sqliteType}`;
-                columnMappings.push({ airtableName: field.name, sqliteName: sqliteColumnName, airtableType: field.type, airtableOptions: field.options });
+            let createTableQuery = `CREATE TABLE IF NOT EXISTS "${sqliteTableName}" (id TEXT PRIMARY KEY`;
+            const fieldDefinitionsForCreateTable = [];
+            // This columnMappings is for the data insertion step, ensuring it uses the same names as table creation
+            const columnMappingsForInsert = [{ airtableName: 'id', sqliteName: 'id', airtableType: 'text', airtableOptions: null }]; 
+
+            for (const fieldConfig of tableViewerConfig.fields) {
+                // fieldConfig.sqliteName is already de-duplicated
+                // fieldConfig.type is airtableType
+                const sqliteType = mapAirtableTypeToSQLite(fieldConfig.type, fieldConfig.options);
+                fieldDefinitionsForCreateTable.push(`"${fieldConfig.sqliteName}" ${sqliteType}`);
+                columnMappingsForInsert.push({
+                    airtableName: fieldConfig.name, // Original Airtable name, for matching with fetched data
+                    sqliteName: fieldConfig.sqliteName, // De-duplicated SQLite name
+                    airtableType: fieldConfig.type,
+                    airtableOptions: fieldConfig.options
+                });
+            }
+
+            if (fieldDefinitionsForCreateTable.length > 0) {
+                createTableQuery += `, ${fieldDefinitionsForCreateTable.join(', ')}`;
             }
             createTableQuery += ');';
-            console.log(`[LOG] CREATE TABLE query for '${sqliteTableName}': ${createTableQuery}`);
+
+            console.log(`[LOG] CREATE TABLE statement for '${sqliteTableName}': ${createTableQuery}`);
             db.exec(createTableQuery);
 
-            // Fetch and Insert Records for the table
+            // Fetch all records for this table
             console.log(`[LOG] Fetching records for table '${tableSchema.name}'...`);
             let allRecords = [];
             let offset = null;
-            let recordsFetchedThisTable = 0;
-
             do {
                 await new Promise(resolve => setTimeout(resolve, AIRTABLE_RATE_LIMIT_DELAY));
-                let recordsUrl = `${AIRTABLE_API_BASE_URL}/${baseId}/${tableSchema.id}`;
-                if (offset) {
-                    recordsUrl += `?offset=${offset}`;
-                }
-                console.log(`[LOG] Fetching from URL: ${recordsUrl}`);
-                const recordsResponse = await axios.get(recordsUrl, {
-                    headers: { 'Authorization': `Bearer ${apiKey}` }
+                const airtableApiUrl = `${AIRTABLE_API_BASE_URL}/${baseId}/${tableSchema.id}`;
+                const response = await axios.get(airtableApiUrl, {
+                    headers: { 'Authorization': `Bearer ${apiKey}` },
+                    params: { offset: offset }
                 });
-                const records = recordsResponse.data.records;
-                console.log(`[LOG] Fetched ${records.length} records in this batch for table '${tableSchema.name}'.`);
-                if (records.length > 0) {
-                    allRecords.push(...records);
-                    recordsFetchedThisTable += records.length;
-                }
-                offset = recordsResponse.data.offset;
-                if(offset) console.log(`[LOG] Next offset for '${tableSchema.name}': ${offset}`); else console.log(`[LOG] No more records for '${tableSchema.name}'.`);
+                allRecords = allRecords.concat(response.data.records);
+                offset = response.data.offset;
             } while (offset);
-            console.log(`[LOG] Total records fetched for table '${tableSchema.name}': ${recordsFetchedThisTable}`);
+            console.log(`[LOG] Fetched ${allRecords.length} records for table '${tableSchema.name}'.`);
 
             if (allRecords.length === 0) {
-                console.log(`[LOG] No records found for table '${tableSchema.name}'. Skipping insertion.`);
+                console.log(`[LOG] No records to insert for table '${sqliteTableName}'.`);
                 continue;
             }
 
-            console.log(`[DIAGNOSTIC] Table: '${tableSchema.name}', Attempting to prepare INSERT for ${columnMappings.length} columns (parameters).`);
-
-            const insertStmt = db.prepare(`
-                INSERT OR IGNORE INTO "${sqliteTableName}" (id, ${columnMappings.slice(1).map(c => `"${c.sqliteName}"`).join(', ')})
-                VALUES (@id, ${columnMappings.slice(1).map(c => `@${c.sqliteName}`).join(', ')})
-            `);
-            console.log(`[LOG] Prepared insert statement for '${sqliteTableName}'. Column mappings:`, JSON.stringify(columnMappings.map(c => c.sqliteName)));
+            // Prepare insert statement dynamically based on de-duplicated column names
+            const insertColumnNames = columnMappingsForInsert.map(m => `"${m.sqliteName}"`).join(', ');
+            const insertPlaceholders = columnMappingsForInsert.map(() => '?').join(', ');
+            const insertSql = `INSERT INTO "${sqliteTableName}" (${insertColumnNames}) VALUES (${insertPlaceholders})`;
+            console.log(`[LOG] Insert SQL for ${sqliteTableName}: ${insertSql}`)
+            const insertStmt = db.prepare(insertSql);
 
             let successfulInserts = 0;
             let failedInserts = 0;
 
+            // Batch insert records
             const insertMany = db.transaction((records) => {
-                for (const i in records) {
-                    const record = records[i];
-                    const recordToInsert = { id: record.id };
-                    for (const mapping of columnMappings.slice(1)) {
-                        let val = record.fields[mapping.airtableName];
-
-                        if (val === undefined || val === null) {
-                            val = null;
-                        } else if (typeof val === 'boolean') {
-                            val = val ? 1 : 0; // Convert boolean to 0 or 1
-                        } else if (val instanceof Date) {
-                            val = val.toISOString(); // Standard format for dates
-                        } else if (typeof val === 'object') { // Check for object AFTER boolean and Date
-                            // This catches arrays and other JS objects that aren't Dates or Buffers
-                            if (!Buffer.isBuffer(val)) { 
-                                val = JSON.stringify(val);
-                            } else {
-                                // If it IS a buffer, better-sqlite3 can handle it directly.
-                                // For now, we don't expect direct buffers from Airtable fields treated this way.
-                            }
-                        } 
-                        // Numbers, other strings, null, and Buffers (if any) will pass through
-                        recordToInsert[mapping.sqliteName] = val;
-                    }
-
-                    if (i === '0') { // Log the first record to be inserted for this table
-                        console.log(`[LOG] Sample recordToInsert for '${sqliteTableName}':`, JSON.stringify(recordToInsert, null, 2));
-                    }
+                for (const record of records) {
+                    const valuesToInsert = columnMappingsForInsert.map(mapping => {
+                        if (mapping.sqliteName === 'id') {
+                            return record.id; // Airtable Record ID for our 'id' PK column
+                        }
+                        // For other columns, use mapping.airtableName (original) to find data in record.fields
+                        const rawValue = record.fields[mapping.airtableName];
+                        return formatValueForSQLite(rawValue, mapping.airtableType, mapping.airtableOptions);
+                    });
 
                     try {
-                        const info = insertStmt.run(recordToInsert);
+                        const info = insertStmt.run(valuesToInsert);
                         if (info.changes > 0) successfulInserts++;
                     } catch (insertError) {
                         failedInserts++;
-                        console.error(`[IMPORTANT ERROR] Skipping record due to insert error in table ${sqliteTableName}: ${insertError.message} Record ID: ${record.id} Problematic Data: ${JSON.stringify(record.fields)}`);
+                        console.error(`[IMPORTANT ERROR] Skipping record due to insert error in table ${sqliteTableName}: ${insertError.message} Record ID: ${record.id} Problematic Data: ${JSON.stringify(record.fields)} Raw values for insert: ${JSON.stringify(valuesToInsert)}`);
                     }
                 }
             });

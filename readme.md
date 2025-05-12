@@ -12,7 +12,11 @@ This project allows you to export data from an Airtable base into an SQLite data
     *   Search within tables.
     *   View linked records.
     *   Paginate through large datasets.
-*   **Handles Airtable Complexity**: The tool attempts to map various Airtable field types (including lookups, rollups, linked records, select options with colors) to appropriate SQLite representations and display them intelligently in the viewer.
+*   **Handles Airtable Complexity**: The tool maps various Airtable field types (including lookups, rollups, linked records, select options with colors) to appropriate SQLite representations. It ensures unique and valid SQLite column names by:
+    *   `Reserving \`id\` as the primary key (TEXT) in each SQLite table to store the original Airtable Record ID.`
+    *   `Renaming any conflicting user-defined Airtable fields to avoid collision with this reserved \`id\` column. For example, an Airtable field named "ID" (case-insensitive after sanitization) would be renamed to \`id_1\`, \`id_2\`, etc.`
+    *   `Resolving other potential naming collisions that arise after sanitizing Airtable field names. For instance, if "Field A" and "Field_A" both sanitize to "Field_A", the second occurrence would be renamed (e.g., to \`Field_A_1\`).`
+    *   `The generated SQLite database includes metadata tables (\`_airtable_meta_tables\` and \`_airtable_meta_fields\`) that store details about the original Airtable schema and these SQLite column name mappings.`
 *   **Rate Limiting**: Respects Airtable API rate limits during data fetching.
 
 ## Technologies Used
