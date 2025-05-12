@@ -1,0 +1,17 @@
+[build]
+  # Netlify typically runs `npm install` automatically if a package.json is present.
+  # You can specify a build command here if needed, e.g., command = "npm run build"
+  publish = "public"  # Assumes your static frontend assets (HTML, CSS, client-side JS) are in the 'public' directory.
+
+# For a Node.js backend like server.js, Netlify often deploys it as a serverless function.
+# This might require placing server.js (or an adapted version) in a 'netlify/functions' directory
+# and potentially adding redirect rules below to route API requests to this function.
+# Example for functions:
+# [functions]
+#   directory = "netlify/functions"
+
+# Example redirect for an API if server.js is a function named 'api':
+# [[redirects]]
+#  from = "/api/*"
+#  to = "/.netlify/functions/api/:splat"
+#  status = 200

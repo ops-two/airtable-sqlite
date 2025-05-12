@@ -1,0 +1,23 @@
+{
+    "name": "airtable-to-sqlite-viewer",
+    "version": "1.0.0",
+    "description": "Generates a downloadable SQLite viewer from Airtable data.",
+    "main": "server.js",
+    "scripts": {
+        "start": "node server.js",
+        "dev": "nodemon server.js"
+    },
+    "engines": {
+        "node": ">=22.0.0"
+    },
+    "dependencies": {
+        "axios": "^1.6.8",
+        "better-sqlite3": "^11.10.0",
+        "express": "^4.19.2",
+        "fs-extra": "^11.0.0",
+        "jszip": "^3.10.0"
+    },
+    "devDependencies": {
+        "nodemon": "^2.0.0"
+    }
+}

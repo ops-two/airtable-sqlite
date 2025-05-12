@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Airtable to SQLite Snapshot Generator</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="container">
+        <h1>Airtable to SQLite Snapshot Generator</h1>
+
+        <div class="step">
+            <h2>Step 1: Enter Airtable API Key (PAT)</h2>
+            <input type="password" id="apiKey" placeholder="pats_YOUR_API_KEY_HERE">
+            <button id="loadBasesBtn">Load Bases</button>
+        </div>
+
+        <div class="step" id="basesSection" style="display:none;">
+            <h2>Step 2: Select a Base</h2>
+            <select id="basesDropdown">
+                <option value="">-- Loading Bases --</option>
+            </select>
+            <button id="generateSnapshotBtn" disabled>Generate & Download Snapshot</button>
+        </div>
+
+        <div id="statusArea">
+            <p id="statusText">Enter your API Key and click "Load Bases".</p>
+            <div id="progressBarContainer" style="display:none;">
+                <div id="progressBar"></div>
+            </div>
+        </div>
+    </div>
+    <script src="script.js"></script>
+</body>
+</html>
